@@ -2,9 +2,8 @@ import os
 import sys
 import time
 import threading
-import subprocess
-import tempfile
 import urllib.request
+import collections
 
 import cv2
 import numpy as np
@@ -13,8 +12,7 @@ import soundfile as sf
 import mediapipe
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
-
-RUBBERBAND = r"H:\Downloads\rubberband-4.0.0-gpl-executable-windows\rubberband-4.0.0-gpl-executable-windows\rubberband.exe"
+from pedalboard import time_stretch
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
@@ -46,89 +44,75 @@ def load_audio(path):
         data = np.column_stack([data, data])
     return data.astype(np.float32)
 
-# ── Rubberband stretch (calls the .exe directly via temp WAV files) ───────────
+# ── Pedalboard stretch ────────────────────────────────────────────────────────
+#
+#  pedalboard.time_stretch expects (audio, sr, stretch_factor)
+#  where audio is (channels, samples) float32.
+#  stretch_factor > 1 = slower (more output samples), < 1 = faster.
+#  We want speed > 1 = faster, so stretch_factor = 1/speed.
 
-def rubberband_stretch(src, speed):
+GRAIN_FRAMES  = SAMPLE_RATE // 4     # 250 ms of source per grain — small enough
+                                     # for snappy response, big enough for quality
+PREFILL_GRAINS = 6                   # ~1.5 s of output buffered before playback starts
+MAX_BUF_FRAMES = SAMPLE_RATE * 8    # cap buffer memory (~8 s)
+
+def stretch_grain(grain_audio, speed):
     """
-    Write src to a temp WAV, run rubberband.exe on it, read back the result.
-    This is exactly what pyrubberband does internally — we just call the exe directly.
+    grain_audio : (N, 2) float32  interleaved stereo
+    returns     : (M, 2) float32  time-stretched
     """
-    if abs(speed - 1.0) < 0.02:
-        return src
+    speed = float(np.clip(speed, 0.25, 3.0))
+    if abs(speed - 1.0) < 0.01:
+        return grain_audio
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_in, \
-         tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_out:
-        in_path  = f_in.name
-        out_path = f_out.name
-
-    try:
-        sf.write(in_path, src, SAMPLE_RATE)
-        subprocess.check_call(
-            [RUBBERBAND, "--tempo", str(speed), "--fine", in_path, out_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        result, _ = sf.read(out_path, dtype="float32", always_2d=True)
-        if result.shape[1] == 1:
-            result = np.column_stack([result, result])
-        return result.astype(np.float32)
-    finally:
-        for p in (in_path, out_path):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+    # pedalboard wants (channels, samples)
+    pcm = grain_audio.T  # (2, N)
+    out = time_stretch(pcm, SAMPLE_RATE, stretch_factor=1.0 / speed)
+    return out.T.astype(np.float32)   # back to (M, 2)
 
 # ── Player ────────────────────────────────────────────────────────────────────
 
-SEGMENT   = SAMPLE_RATE * 4   # stretch 4s at a time
-LOOKAHEAD = SAMPLE_RATE * 2   # refill when < 2s left in buffer
-
 class Player:
     def __init__(self, audio):
-        self.audio       = audio
-        self._src_pos    = 0
-        self._play_pos   = 0
-        self._buf        = np.zeros((0, 2), dtype=np.float32)
-        self._speed      = 1.0
-        self._last_speed = None
-        self._lock       = threading.Lock()
-        self._stream     = None
-        self._running    = False
-        self._thread     = threading.Thread(target=self._refill_loop, daemon=True)
+        self.audio      = audio          # (N, 2) float32
+        self._src_pos   = 0              # next source frame to consume
+        self._buf       = collections.deque()   # deque of np arrays (chunks)
+        self._buf_len   = 0              # total frames in deque
+        self._speed     = 1.0
+        self._lock      = threading.Lock()
+        self._stream    = None
+        self._running   = False
+        self._refill_event = threading.Event()
+        self._thread    = threading.Thread(target=self._refill_loop, daemon=True)
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def start(self):
         self._running = True
         self._thread.start()
-        print("Buffering first segment (rubberband)...")
+
+        print("Buffering initial audio...")
         while True:
             with self._lock:
-                if len(self._buf) - self._play_pos > SAMPLE_RATE:
-                    break
+                ready = self._buf_len >= GRAIN_FRAMES * PREFILL_GRAINS
+            if ready:
+                break
             time.sleep(0.05)
-
-        def callback(outdata, frames, time_info, status):
-            with self._lock:
-                avail = len(self._buf) - self._play_pos
-                take  = min(frames, avail)
-                if take > 0:
-                    outdata[:take] = self._buf[self._play_pos:self._play_pos + take]
-                    self._play_pos += take
-                if take < frames:
-                    outdata[take:] = 0
+        print("Ready — showing camera.\n")
 
         self._stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=2,
             dtype="float32",
             blocksize=512,
-            callback=callback,
+            callback=self._audio_callback,
         )
         self._stream.start()
 
     def set_speed(self, s):
         with self._lock:
             self._speed = float(np.clip(s, 0.25, 3.0))
+        self._refill_event.set()   # wake refill thread immediately
 
     def get_speed(self):
         with self._lock:
@@ -136,49 +120,79 @@ class Player:
 
     def stop(self):
         self._running = False
+        self._refill_event.set()
         if self._stream:
             self._stream.stop()
             self._stream.close()
 
+    # ── audio callback (runs on sounddevice thread) ───────────────────────────
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            needed = frames
+            filled = 0
+            while needed > 0 and self._buf:
+                chunk = self._buf[0]
+                take  = min(len(chunk), needed)
+                outdata[filled:filled + take] = chunk[:take]
+                filled  += take
+                needed  -= take
+                self._buf_len -= take
+                if take == len(chunk):
+                    self._buf.popleft()
+                else:
+                    self._buf[0] = chunk[take:]
+            if filled < frames:
+                outdata[filled:] = 0   # underrun — refill thread is behind
+
+        self._refill_event.set()   # wake refill thread to top up
+
+    # ── refill loop (background thread) ──────────────────────────────────────
+
+    REFILL_TARGET = SAMPLE_RATE * 3   # keep ~3 s of stretched audio buffered
+
     def _refill_loop(self):
         while self._running:
             with self._lock:
-                speed      = self._speed
-                last_speed = self._last_speed
-                remaining  = len(self._buf) - self._play_pos
-                src_pos    = self._src_pos
+                buf_len = self._buf_len
+                speed   = self._speed
+                src_pos = self._src_pos
 
-            speed_changed = last_speed is None or abs(speed - last_speed) > 0.02
+            if buf_len < self.REFILL_TARGET:
+                end  = min(src_pos + GRAIN_FRAMES, len(self.audio))
+                grain = self.audio[src_pos:end]
 
-            if speed_changed or remaining < LOOKAHEAD:
-                end = min(src_pos + SEGMENT, len(self.audio))
-                seg = self.audio[src_pos:end]
-
-                if len(seg) == 0:
+                if len(grain) == 0:
                     with self._lock:
                         self._src_pos = 0
                     continue
 
-                stretched = rubberband_stretch(seg, speed)
+                stretched = stretch_grain(grain, speed)
 
                 with self._lock:
-                    if speed_changed:
-                        kept           = self._buf[:self._play_pos]
-                        self._buf      = np.vstack([kept, stretched]) if len(kept) else stretched
-                        self._play_pos = len(kept)
-                    else:
-                        self._buf = np.vstack([self._buf, stretched]) if len(self._buf) else stretched
+                    # Trim buffer if it somehow grew huge (e.g. speed < 1 for a long time)
+                    if self._buf_len > MAX_BUF_FRAMES:
+                        excess = self._buf_len - MAX_BUF_FRAMES
+                        while excess > 0 and self._buf:
+                            c = self._buf.popleft()
+                            if len(c) <= excess:
+                                excess -= len(c)
+                                self._buf_len -= len(c)
+                            else:
+                                self._buf.appendleft(c[excess:])
+                                self._buf_len -= excess
+                                break
 
-                    self._src_pos    = 0 if end >= len(self.audio) else end
-                    self._last_speed = speed
+                    self._buf.append(stretched)
+                    self._buf_len += len(stretched)
+                    self._src_pos  = 0 if end >= len(self.audio) else end
 
-                    # trim consumed audio to keep memory bounded
-                    trim = self._play_pos - SAMPLE_RATE
-                    if trim > 0:
-                        self._buf      = self._buf[trim:]
-                        self._play_pos -= trim
-            else:
-                time.sleep(0.1)
+                # Don't sleep — immediately check if more needed
+                continue
+
+            # Buffer is full enough; wait until callback signals we need more
+            self._refill_event.wait(timeout=0.05)
+            self._refill_event.clear()
 
 # ── Speed mapping ─────────────────────────────────────────────────────────────
 
@@ -258,7 +272,8 @@ def main():
             dx   = left_tip[0] - right_tip[0]
             dy   = left_tip[1] - right_tip[1]
             dist = (dx**2 + dy**2) ** 0.5
-            smoothed = 0.08 * dist_to_speed(dist) + 0.92 * smoothed
+            # Slightly faster smoothing than before so gestures feel more responsive
+            smoothed = 0.15 * dist_to_speed(dist) + 0.85 * smoothed
             player.set_speed(smoothed)
             cv2.line(frame, left_tip[2], right_tip[2], (255, 220, 0), 2)
 
@@ -286,4 +301,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
